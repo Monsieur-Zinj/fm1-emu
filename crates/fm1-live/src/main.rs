@@ -42,6 +42,7 @@ use panel::{Ctl, ENCS, H, W};
 
 #[path = "../../fm1-emu/src/buildinfo.rs"]
 mod buildinfo;
+mod firmware_picker;
 mod latch;
 mod panel;
 mod panel_smk;
@@ -1383,9 +1384,12 @@ fn main() {
     };
 
     if board == fm1_soc::Board::Smk37 {
-        window_smk(&o, &tx, &lcd, &leds, &pads, &status);
+        let next = window_smk(&o, &tx, &lcd, &leds, &pads, &status);
         quit.store(true, Ordering::Relaxed);
         let _ = emu.join();
+        drop(_midi);
+        drop(_stream);
+        if let Some(path) = next { firmware_picker::restart(&path); }
         return;
     }
     let mut win = match Window::new(&format!("FM-1 · {} (emulated)", o.name), W, H, WindowOptions::default()) {
@@ -1407,12 +1411,14 @@ fn main() {
     let mut shown_leds = [0f32; 41];
     let mut grab: Option<Ctl> = None;
     let mut was_pressed = false;
+    let mut next_firmware = None;
     let mut latched = latch::Latches::<41>::new();
     let mut mouse_vel = 0u8;                    // the key under the mouse: how hard (its height; lower = harder)
     let (mut last_y, mut drag_acc) = (0f32, 0f32);
     let mut last_title = Instant::now();
     eprintln!("mouse: click/drag the keys (lower = harder; drag down on a held key = aftertouch), click buttons, drag or scroll the knobs (MASTER = volume)");
     eprintln!("right-click any key or button to hold it; right-click it again to release it (green dot = held)");
+    eprintln!("F2 or CHANGE FIRMWARE: choose another firmware (macOS)");
     eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; Esc quits");
 
     while win.is_open() && !win.is_key_down(Key::Escape) {
@@ -1425,6 +1431,14 @@ fn main() {
         // ---- mouse
         let pos = win.get_mouse_pos(MouseMode::Clamp);
         let pressed = win.get_mouse_down(MouseButton::Left);
+        let picker_clicked = pressed && !was_pressed && pos.is_some_and(|(x, y)| (20.0..335.0).contains(&x) && (18.0..48.0).contains(&y));
+        if picker_clicked || win.is_key_pressed(Key::F2, KeyRepeat::No) {
+            match firmware_picker::choose(&catalog(), o.flash.is_some()) {
+                Ok(Some(path)) => { next_firmware = Some(path); break; }
+                Ok(None) => {}
+                Err(error) => firmware_picker::report_error(&error),
+            }
+        }
         let right = win.get_mouse_down(MouseButton::Right);
         let right_hit = pos.and_then(|(x, y)| panel::hit(x, y));
         let latch_id = match right_hit {
@@ -1558,6 +1572,8 @@ fn main() {
             let fb = lcd.lock().unwrap();
             let st = panel::State { lcd: &fb, enc_clicks: &enc_clicks, pot, down: &down, leds: &shown_leds, turning: &turning };
             panel::draw(&mut buf, &base, &st);
+            panel::rrect(&mut buf, 20.0, 18.0, 315.0, 30.0, 6.0, 0x24272a, 0x17191c);
+            panel::text(&mut buf, 177.5, 26.0, "F2 CHANGE FIRMWARE", 2, panel::SILK);
             for (id, x, y, w, _, _) in panel::keys() {
                 if latched.is_held(id as usize) { panel::disc(&mut buf, (x + w / 2) as f32, (y + 12) as f32, 5.0, |_, _| panel::GREEN); }
             }
@@ -1575,17 +1591,21 @@ fn main() {
     }
     quit.store(true, Ordering::Relaxed);
     let _ = emu.join();
+    drop(win);
+    drop(_midi);
+    drop(_stream);
+    if let Some(path) = next_firmware { firmware_picker::restart(&path); }
 }
 
 /// The SMK-37's window: its panel (panel_smk.rs), the mouse on its keys (velocity: how far down
 /// a key is hit), pads, faders, wheels and knobs; the computer keyboard as on the page.
-fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: &Mutex<[f32; 41]>, pads: &Mutex<[u32; 16]>, status: &Mutex<String>) {
+fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: &Mutex<[f32; 41]>, pads: &Mutex<[u32; 16]>, status: &Mutex<String>) -> Option<std::path::PathBuf> {
     use fm1_soc::smk::{ANALOG_MOD, ANALOG_PITCH, MOD_REST, PITCH_REST};
     use panel_smk::Ctl as S;
     let (w, h) = (panel_smk::W, panel_smk::H);
     let mut win = match Window::new(&format!("SMK-37 · {} (emulated)", o.name), w, h, WindowOptions { resize: true, ..WindowOptions::default() }) {
         Ok(w) => w,
-        Err(e) => return eprintln!("window: {e}"),
+        Err(e) => { eprintln!("window: {e}"); return None; }
     };
     win.set_target_fps(60);
     let base = panel_smk::base();
@@ -1613,8 +1633,21 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
     let mut last_title = Instant::now();
     eprintln!("SMK-37: click the keys (lower = harder), pads, buttons; drag faders, wheels, knobs. A..' C4..F5, Z/X OCTAVE, Space SEQ PLAY, R SEQ REC, 1..8 pads, arrows K1/K2; Esc quits");
     eprintln!("right-click keys, buttons or pads to hold/release them (green dot = held)");
+    eprintln!("F2 or CHANGE FIRMWARE: choose another firmware (macOS)");
     while win.is_open() && !win.is_key_down(Key::Escape) {
         let pressed = win.get_mouse_down(MouseButton::Left);
+        let picker_clicked = pressed && !was_pressed && win.get_mouse_pos(MouseMode::Clamp).is_some_and(|(x, y)| {
+            let (ww, wh) = win.get_size();
+            let (x, y) = (x * w as f32 / ww.max(1) as f32, y * h as f32 / wh.max(1) as f32);
+            (930.0..1245.0).contains(&x) && (15.0..45.0).contains(&y)
+        });
+        if picker_clicked || win.is_key_pressed(Key::F2, KeyRepeat::No) {
+            match firmware_picker::choose(&catalog(), o.flash.is_some()) {
+                Ok(Some(path)) => return Some(path),
+                Ok(None) => {}
+                Err(error) => firmware_picker::report_error(&error),
+            }
+        }
         let right = win.get_mouse_down(MouseButton::Right);
         let right_hit = win.get_mouse_pos(MouseMode::Clamp).and_then(|(x, y)| {
             let (ww, wh) = win.get_size();
@@ -1748,6 +1781,8 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
                 modw: analog[ANALOG_MOD as usize],
             };
             panel_smk::draw(&mut buf, &base, &st);
+            panel::rrect(&mut buf, 930.0, 15.0, 315.0, 30.0, 6.0, 0x34363a, 0x232529);
+            panel::text(&mut buf, 1087.5, 23.0, "F2 CHANGE FIRMWARE", 2, panel::SILK);
             for (id, x, y, w, _, _) in panel_smk::keys() {
                 if latched.is_held(id as usize) { panel::disc(&mut buf, (x + w / 2) as f32, (y + 12) as f32, 5.0, |_, _| panel::GREEN); }
             }
@@ -1766,6 +1801,7 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
             last_title = Instant::now();
         }
     }
+    None
 }
 
 #[cfg(test)]

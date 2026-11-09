@@ -279,6 +279,12 @@ release it. Several controls can be held at once and a green dot marks each held
 SMK-37's pads can be held the same way. Left-click and the computer keyboard continue to work
 while controls are held. Closing the window releases all holds.
 
+On macOS, click **F2 CHANGE FIRMWARE** in the desktop window (or press F2) to choose a firmware
+from the FM-1 catalog or open a `.fwsc` file. Launch from the repository root to use the catalog;
+missing catalog packages are downloaded using Node.js. Switching restarts the emulator and discards
+unsaved changes. For safety, switching is disabled when using `--flash`, so one firmware's flash
+image cannot accidentally be used with another. Cancel to keep the current firmware running.
+
 `fm1-live` compiles the firmware to native code on Macs (Apple silicon and Intel), on Linux (ARM64
 and x86-64) and on Windows (x86-64), and runs the real 240 MHz clock with it; elsewhere it interprets
 (`--mhz` lowers the clock if that can't keep up). It plays every MIDI input of the computer (`--midi NAME`, `--midi none`,
