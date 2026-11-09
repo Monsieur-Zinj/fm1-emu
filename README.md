@@ -274,6 +274,11 @@ cargo run --release -p fm1-live -- --fw felucca         # a window with the synt
 cargo run --release -p fm1-live -- --fwsc FM-1.fwsc     # M-VAVE's own, from its package
 ```
 
+In the desktop window, right-click any key or button to hold it down; right-click it again to
+release it. Several controls can be held at once and a green dot marks each held control. The
+SMK-37's pads can be held the same way. Left-click and the computer keyboard continue to work
+while controls are held. Closing the window releases all holds.
+
 `fm1-live` compiles the firmware to native code on Macs (Apple silicon and Intel), on Linux (ARM64
 and x86-64) and on Windows (x86-64), and runs the real 240 MHz clock with it; elsewhere it interprets
 (`--mhz` lowers the clock if that can't keep up). It plays every MIDI input of the computer (`--midi NAME`, `--midi none`,

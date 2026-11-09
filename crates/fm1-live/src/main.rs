@@ -42,6 +42,7 @@ use panel::{Ctl, ENCS, H, W};
 
 #[path = "../../fm1-emu/src/buildinfo.rs"]
 mod buildinfo;
+mod latch;
 mod panel;
 mod panel_smk;
 use std::collections::VecDeque;
@@ -1406,10 +1407,12 @@ fn main() {
     let mut shown_leds = [0f32; 41];
     let mut grab: Option<Ctl> = None;
     let mut was_pressed = false;
+    let mut latched = latch::Latches::<41>::new();
     let mut mouse_vel = 0u8;                    // the key under the mouse: how hard (its height; lower = harder)
     let (mut last_y, mut drag_acc) = (0f32, 0f32);
     let mut last_title = Instant::now();
     eprintln!("mouse: click/drag the keys (lower = harder; drag down on a held key = aftertouch), click buttons, drag or scroll the knobs (MASTER = volume)");
+    eprintln!("right-click any key or button to hold it; right-click it again to release it (green dot = held)");
     eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; Esc quits");
 
     while win.is_open() && !win.is_key_down(Key::Escape) {
@@ -1422,6 +1425,13 @@ fn main() {
         // ---- mouse
         let pos = win.get_mouse_pos(MouseMode::Clamp);
         let pressed = win.get_mouse_down(MouseButton::Left);
+        let right = win.get_mouse_down(MouseButton::Right);
+        let right_hit = pos.and_then(|(x, y)| panel::hit(x, y));
+        let latch_id = match right_hit {
+            Some(Ctl::Key(id) | Ctl::Btn(id)) => Some(id as usize),
+            _ => None,
+        };
+        latched.update(right, latch_id);
         if let Some((mx, my)) = pos {
             if pressed && !was_pressed {
                 grab = panel::hit(mx, my);
@@ -1506,13 +1516,18 @@ fn main() {
         if let Some(Ctl::Key(id) | Ctl::Btn(id)) = grab {
             want[id as usize] = true;
         }
+        latched.merge(&mut want);
         for id in 0..41 {
             if want[id] != down[id] {
                 down[id] = want[id];
                 if want[id] && id >= 14 {
                     // the mouse's key at its height, the computer keyboard's at 100
                     let mouse = matches!(grab, Some(Ctl::Key(k)) if k as usize == id);
-                    let _ = tx.send(Action::KeyVel { vel: if mouse { mouse_vel } else { 100 } });
+                    let right_vel = match (right, right_hit, pos) {
+                        (true, Some(Ctl::Key(k)), Some((_, y))) if k as usize == id => Some(panel::key_vel(k, y)),
+                        _ => None,
+                    };
+                    let _ = tx.send(Action::KeyVel { vel: if mouse { mouse_vel } else { right_vel.unwrap_or(100) } });
                 }
                 let _ = tx.send(Action::Key { id: id as u8, down: want[id] });
             }
@@ -1543,6 +1558,12 @@ fn main() {
             let fb = lcd.lock().unwrap();
             let st = panel::State { lcd: &fb, enc_clicks: &enc_clicks, pot, down: &down, leds: &shown_leds, turning: &turning };
             panel::draw(&mut buf, &base, &st);
+            for (id, x, y, w, _, _) in panel::keys() {
+                if latched.is_held(id as usize) { panel::disc(&mut buf, (x + w / 2) as f32, (y + 12) as f32, 5.0, |_, _| panel::GREEN); }
+            }
+            for (_, id, x, y, w, _) in panel::buttons() {
+                if latched.is_held(id as usize) { panel::disc(&mut buf, (x + w / 2) as f32, (y + 8) as f32, 4.0, |_, _| panel::GREEN); }
+            }
         }
         if win.update_with_buffer(&buf, W, H).is_err() {
             break;
@@ -1588,10 +1609,23 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
     // 0 (softest) .. 1 (hardest) -> 80 ms .. 2 ms between a key's two contacts
     let vel = |f: f32| Action::Vel { us: (80_000f32.ln() + (2_000f32.ln() - 80_000f32.ln()) * f.clamp(0.0, 1.0)).exp() as u32 };
     let (mut grab, mut was_pressed, mut last_y, mut drag_acc, mut scroll_acc) = (None, false, 0f32, 0f32, [0f32; 8]);
+    let mut latched = latch::Latches::<80>::new(); // keys/buttons 0..63, pads 64..79
     let mut last_title = Instant::now();
     eprintln!("SMK-37: click the keys (lower = harder), pads, buttons; drag faders, wheels, knobs. A..' C4..F5, Z/X OCTAVE, Space SEQ PLAY, R SEQ REC, 1..8 pads, arrows K1/K2; Esc quits");
+    eprintln!("right-click keys, buttons or pads to hold/release them (green dot = held)");
     while win.is_open() && !win.is_key_down(Key::Escape) {
         let pressed = win.get_mouse_down(MouseButton::Left);
+        let right = win.get_mouse_down(MouseButton::Right);
+        let right_hit = win.get_mouse_pos(MouseMode::Clamp).and_then(|(x, y)| {
+            let (ww, wh) = win.get_size();
+            panel_smk::hit(x * w as f32 / ww.max(1) as f32, y * h as f32 / wh.max(1) as f32)
+        });
+        let latch_id = match right_hit {
+            Some(S::Key(id, _) | S::Btn(id)) => Some(id as usize),
+            Some(S::Pad(p)) => Some(64 + p),
+            _ => None,
+        };
+        latched.update(right, latch_id);
         if let Some((mx, my)) = win.get_mouse_pos(MouseMode::Clamp) {
             // (the window may be resized: back to panel coordinates)
             let (ww, wh) = win.get_size();
@@ -1638,7 +1672,6 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
         }
         if !pressed {
             match grab {
-                Some(S::Pad(p)) => set_analog(&mut analog, p, 0),
                 Some(S::Pitch) => set_analog(&mut analog, ANALOG_PITCH as usize, PITCH_REST),
                 _ => {}
             }
@@ -1662,19 +1695,23 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
                 pad_keys[p] = true;
             }
         }
-        for (p, &on) in pad_keys.iter().enumerate() {
-            if grab != Some(S::Pad(p)) {
-                set_analog(&mut analog, p, if on { 700 } else { 0 });
-            }
+        for p in 0..16 {
+            let on = (p < 8 && pad_keys[p]) || grab == Some(S::Pad(p)) || latched.is_held(64 + p);
+            set_analog(&mut analog, p, if on { 700 } else { 0 });
         }
         match grab {
             Some(S::Key(id, _)) | Some(S::Btn(id)) => want[id as usize] = true,
             _ => {}
         }
+        latched.merge(&mut want);
         for id in 0..55 {
             if want[id] != down[id] {
                 if want[id] && id < 37 && !matches!(grab, Some(S::Key(k, _)) if k as usize == id) {
-                    let _ = tx.send(vel(0.75));
+                    let f = match (right, right_hit) {
+                        (true, Some(S::Key(k, f))) if k as usize == id => f,
+                        _ => 0.75,
+                    };
+                    let _ = tx.send(vel(f));
                 }
                 down[id] = want[id];
                 let _ = tx.send(Action::Key { id: id as u8, down: want[id] });
@@ -1711,6 +1748,15 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
                 modw: analog[ANALOG_MOD as usize],
             };
             panel_smk::draw(&mut buf, &base, &st);
+            for (id, x, y, w, _, _) in panel_smk::keys() {
+                if latched.is_held(id as usize) { panel::disc(&mut buf, (x + w / 2) as f32, (y + 12) as f32, 5.0, |_, _| panel::GREEN); }
+            }
+            for (_, id, x, y, w, _) in panel_smk::buttons() {
+                if latched.is_held(id as usize) { panel::disc(&mut buf, (x + w / 2) as f32, (y + 8) as f32, 4.0, |_, _| panel::GREEN); }
+            }
+            for (p, (x, y, w, _)) in panel_smk::pads().iter().enumerate() {
+                if latched.is_held(64 + p) { panel::disc(&mut buf, (x + w / 2) as f32, (y + 8) as f32, 5.0, |_, _| panel::GREEN); }
+            }
         }
         if win.update_with_buffer(&buf, w, h).is_err() {
             break;
